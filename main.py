@@ -53,12 +53,13 @@ def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: i
         raise ValueError("invalid original size")
 
     sW, sH = w0 * scale, h0 * scale
-    tW = max(multiple, (sW // multiple) * multiple)
-    tH = max(multiple, (sH // multiple) * multiple)
+    # Round UP to next multiple to avoid cropping
+    tW = ((sW + multiple - 1) // multiple) * multiple
+    tH = ((sH + multiple - 1) // multiple) * multiple
     return sW, sH, tW, tH
 
 
-def tensor_upscale_then_center_crop(
+def tensor_upscale_then_pad(
     frame_tensor: torch.Tensor, scale: int, tW: int, tH: int
 ) -> torch.Tensor:
     h0, w0, c = frame_tensor.shape
@@ -67,11 +68,22 @@ def tensor_upscale_then_center_crop(
     sW, sH = w0 * scale, h0 * scale
     upscaled_tensor = F.interpolate(tensor_bchw, size=(sH, sW), mode="bicubic", align_corners=False)
 
-    l = max(0, (sW - tW) // 2)
-    t = max(0, (sH - tH) // 2)
-    cropped_tensor = upscaled_tensor[:, :, t : t + tH, l : l + tW]
+    # Pad instead of crop
+    pad_w = tW - sW
+    pad_h = tH - sH
 
-    return cropped_tensor.squeeze(0)
+    # Symmetric padding (split difference on both sides)
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+
+    # F.pad uses (left, right, top, bottom) for last 2 dimensions
+    padded_tensor = F.pad(
+        upscaled_tensor, (pad_left, pad_right, pad_top, pad_bottom), mode="replicate"
+    )
+
+    return padded_tensor.squeeze(0)
 
 
 def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
@@ -90,9 +102,7 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
         frame_idx = min(i, N0 - 1)
         frame_slice = image_tensor[frame_idx].to(device)
         tensor_chw = (
-            tensor_upscale_then_center_crop(frame_slice, scale=scale, tW=tW, tH=tH)
-            .to("cpu")
-            .to(dtype)
+            tensor_upscale_then_pad(frame_slice, scale=scale, tW=tW, tH=tH).to("cpu").to(dtype)
             * 2.0
             - 1.0
         )
@@ -262,6 +272,8 @@ def flashvsr(
             )
 
             input_tile = _frames[:, y1:y2, x1:x2, :]
+            input_tile_h = y2 - y1
+            input_tile_w = x2 - x1
 
             LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
             LQ_tile = LQ_tile.to(_device)
@@ -289,16 +301,27 @@ def flashvsr(
 
             processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
 
+            exact_tile_h = input_tile_h * scale
+            exact_tile_w = input_tile_w * scale
+
+            pad_h = th - exact_tile_h
+            pad_w = tw - exact_tile_w
+
+            crop_top = pad_h // 2
+            crop_bottom = crop_top + exact_tile_h
+            crop_left = pad_w // 2
+            crop_right = crop_left + exact_tile_w
+            processed_tile_cpu = processed_tile_cpu[
+                :, crop_top:crop_bottom, crop_left:crop_right, :
+            ]
             mask_nchw = create_feather_mask(
-                (processed_tile_cpu.shape[1], processed_tile_cpu.shape[2]), tile_overlap * scale
+                (exact_tile_h, exact_tile_w), tile_overlap * scale
             ).to("cpu")
             mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
 
             out_x1, out_y1 = x1 * scale, y1 * scale
-
-            tile_H_scaled = processed_tile_cpu.shape[1]
-            tile_W_scaled = processed_tile_cpu.shape[2]
-            out_x2, out_y2 = out_x1 + tile_W_scaled, out_y1 + tile_H_scaled
+            out_x2, out_y2 = out_x1 + exact_tile_w, out_y1 + exact_tile_h
+            
             final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += (
                 processed_tile_cpu * mask_nhwc
             )
@@ -360,10 +383,10 @@ def main():
     scale = 4
     tiled_vae = True
     tiled_dit = True
-    unload_dit = False
+    unload_dit = True
     seed = 0
 
-    video_path = "../train_videos/000.mp4"
+    video_path = "../videolq_videos/000.mp4"
 
     decoder = VideoDecoder(video_path, dimension_order="NHWC")
     frames = decoder[:].float() / 255.0
@@ -386,7 +409,7 @@ def main():
         color_fix=True,
         tiled_vae=tiled_vae,
         tiled_dit=tiled_dit,
-        tile_size=128 + 32 +32,
+        tile_size=128 + 32 + 32,
         tile_overlap=24,
         unload_dit=unload_dit,
         sparse_ratio=2.0,
