@@ -5,9 +5,11 @@
 import math
 import os
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+from PIL import Image
 from torchcodec.decoders import VideoDecoder
 from torchcodec.encoders import VideoEncoder
 from tqdm import tqdm
@@ -161,6 +163,52 @@ def create_feather_mask(size, overlap):
     return mask
 
 
+def calculate_temporal_chunks(total_frames, chunk_size, overlap):
+    """Calculate temporal chunk ranges with overlap."""
+    chunks = []
+    stride = chunk_size - overlap
+
+    num_chunks = math.ceil((total_frames - overlap) / stride)
+
+    for i in range(num_chunks):
+        start = i * stride
+        end = min(start + chunk_size, total_frames)
+        chunks.append((start, end))
+
+    return chunks
+
+
+def blend_overlap_region(prev_chunk_tail, current_chunk_head, overlap):
+    """
+    Blend only the overlapping region of two chunks.
+
+    Args:
+        prev_chunk_tail: Last 'overlap' frames from previous chunk
+        current_chunk_head: First 'overlap' frames from current chunk
+        overlap: Number of overlapping frames
+
+    Returns:
+        Blended frames (size: overlap)
+    """
+    if overlap <= 0 or prev_chunk_tail is None:
+        return current_chunk_head
+
+    actual_overlap = min(overlap, prev_chunk_tail.shape[0], current_chunk_head.shape[0])
+
+    if actual_overlap <= 0:
+        return current_chunk_head
+
+    # Create blend weights: 1 -> 0 (favor previous chunk at start, current chunk at end)
+    blend_weight = torch.linspace(1, 0, actual_overlap).view(-1, 1, 1, 1)
+
+    # Blend
+    blended = prev_chunk_tail[-actual_overlap:] * blend_weight + current_chunk_head[
+        :actual_overlap
+    ] * (1 - blend_weight)
+
+    return blended
+
+
 def init_pipeline(model: str, device: torch.device, dtype: torch.dtype) -> FlashVSRTinyPipeline:
     """Initialize FlashVSR pipeline with given model and device.
 
@@ -231,15 +279,14 @@ def init_pipeline(model: str, device: torch.device, dtype: torch.dtype) -> Flash
     return pipe
 
 
-def flashvsr(
+def process_single_temporal_chunk(
     pipe,
-    frames,
+    frames_chunk,
     scale,
     color_fix,
-    tiled_vae,
-    tiled_dit,
-    tile_size,
-    tile_overlap,
+    spatial_tiling,
+    spatial_tile_size,
+    spatial_tile_overlap,
     unload_dit,
     sparse_ratio,
     kv_ratio,
@@ -247,30 +294,32 @@ def flashvsr(
     seed,
     force_offload,
 ):
-    _frames = frames
+    """Process a single temporal chunk of frames."""
     _device = pipe.device
     dtype = pipe.torch_dtype
 
-    add = next_8n5(frames.shape[0]) - frames.shape[0]
-    padding_frames = frames[-1:, :, :, :].repeat(add, 1, 1, 1)
-    _frames = torch.cat([frames, padding_frames], dim=0)
+    # Add padding frames for model requirements
+    add = next_8n5(frames_chunk.shape[0]) - frames_chunk.shape[0]
+    if add > 0:
+        padding_frames = frames_chunk[-1:, :, :, :].repeat(add, 1, 1, 1)
+        _frames = torch.cat([frames_chunk, padding_frames], dim=0)
+    else:
+        _frames = frames_chunk
 
-    if tiled_dit:
+    if spatial_tiling:
         N, H, W, C = _frames.shape
 
         final_output_canvas = torch.zeros(
             (N, H * scale, W * scale, C), dtype=torch.float16, device="cpu"
         )
         weight_sum_canvas = torch.zeros_like(final_output_canvas)
-        tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
-        latent_tiles_cpu = []
+        tile_coords = calculate_tile_coords(H, W, spatial_tile_size, spatial_tile_overlap)
 
-        for i, (x1, y1, x2, y2) in enumerate(tqdm(tile_coords, desc="Processing Tiles")):
+        for i, (x1, y1, x2, y2) in enumerate(tile_coords):
             log(
                 f"[FlashVSR] Processing tile {i + 1}/{len(tile_coords)}: coords ({x1},{y1}) to ({x2},{y2})",
                 message_type="info",
             )
-
             input_tile = _frames[:, y1:y2, x1:x2, :]
             input_tile_h = y2 - y1
             input_tile_w = x2 - x1
@@ -284,7 +333,6 @@ def flashvsr(
                 cfg_scale=1.0,
                 num_inference_steps=1,
                 seed=seed,
-                tiled=tiled_vae,
                 LQ_video=LQ_tile,
                 num_frames=F,
                 height=th,
@@ -314,14 +362,15 @@ def flashvsr(
             processed_tile_cpu = processed_tile_cpu[
                 :, crop_top:crop_bottom, crop_left:crop_right, :
             ]
+
             mask_nchw = create_feather_mask(
-                (exact_tile_h, exact_tile_w), tile_overlap * scale
+                (exact_tile_h, exact_tile_w), spatial_tile_overlap * scale
             ).to("cpu")
             mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
 
             out_x1, out_y1 = x1 * scale, y1 * scale
             out_x2, out_y2 = out_x1 + exact_tile_w, out_y1 + exact_tile_h
-            
+
             final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += (
                 processed_tile_cpu * mask_nhwc
             )
@@ -333,10 +382,8 @@ def flashvsr(
         weight_sum_canvas[weight_sum_canvas == 0] = 1.0
         final_output = final_output_canvas / weight_sum_canvas
     else:
-        log("[FlashVSR] Preparing frames...")
         LQ, th, tw, F = prepare_input_tensor(_frames, _device, scale=scale, dtype=dtype)
         LQ = LQ.to(_device)
-        log(f"[FlashVSR] Processing {frames.shape[0]} frames...", message_type="info")
 
         video = pipe(
             prompt="",
@@ -344,8 +391,6 @@ def flashvsr(
             cfg_scale=1.0,
             num_inference_steps=1,
             seed=seed,
-            tiled=tiled_vae,
-            progress_bar_cmd=tqdm,
             LQ_video=LQ,
             num_frames=F,
             height=th,
@@ -365,31 +410,232 @@ def flashvsr(
         del video, LQ
         clean_vram()
 
-    log("[FlashVSR] Done.", message_type="info")
-    if frames.shape[0] == 1:
-        final_output = final_output.to(_device)
-        stacked_image_tensor = (
-            torch.median(final_output, dim=0).values.unsqueeze(0).float().to("cpu")
-        )
-        del final_output
-        clean_vram()
-        return stacked_image_tensor
+    # Remove padding frames
+    return final_output[: frames_chunk.shape[0], :, :, :]
 
-    return final_output[: frames.shape[0], :, :, :]
+
+def save_frame_as_png(frame_tensor, output_dir, frame_number):
+    """
+    Save a single frame as PNG file.
+
+    Args:
+        frame_tensor: Single frame tensor (H, W, C) in range [0, 1]
+        output_dir: Directory to save the PNG file
+        frame_number: Frame number for filename
+    """
+    # Convert to numpy and scale to 0-255
+    frame_np = (frame_tensor.cpu().numpy() * 255).astype(np.uint8)
+
+    # Create PIL Image and save
+    img = Image.fromarray(frame_np)
+    output_path = os.path.join(output_dir, f"frame_{frame_number:06d}.png")
+    img.save(output_path)
+
+
+def flashvsr(
+    pipe,
+    video_decoder: VideoDecoder,
+    total_frames,
+    output_dir,
+    frame_rate,
+    scale,
+    color_fix,
+    spatial_tiling,
+    spatial_tile_size,
+    spatial_tile_overlap,
+    temporal_tiling,
+    temporal_tile_size,
+    temporal_tile_overlap,
+    unload_dit,
+    sparse_ratio,
+    kv_ratio,
+    local_range,
+    seed,
+    force_offload,
+):
+    """
+    Process video using FlashVSR with temporal tiling support.
+    Writes output incrementally to avoid RAM overflow.
+
+    Args:
+        pipe: FlashVSR pipeline
+        video_decoder: VideoDecoder instance for loading frames
+        total_frames: Total number of frames in the video
+        output_path: Path to save output video
+        frame_rate: Output video frame rate
+        ... (other parameters)
+    """
+
+    # Temporal tiling mode - process chunks and write incrementally
+    if temporal_tiling and total_frames > temporal_tile_size:
+        log(
+            f"[FlashVSR] Using temporal tiling: {total_frames} frames, chunk size: {temporal_tile_size}, overlap: {temporal_tile_overlap}",
+            message_type="info",
+        )
+
+        chunks = calculate_temporal_chunks(total_frames, temporal_tile_size, temporal_tile_overlap)
+        log(f"[FlashVSR] Created {len(chunks)} temporal chunks", message_type="info")
+
+        prev_chunk_tail = None  # Store only the overlapping tail from previous chunk
+
+        for chunk_idx, (start, end) in enumerate(tqdm(chunks, desc="Processing Temporal Chunks")):
+            log(
+                f"[FlashVSR] Loading and processing chunk {chunk_idx + 1}/{len(chunks)}: frames {start}-{end}",
+                message_type="info",
+            )
+
+            # Load and process current chunk
+            chunk_frames = (
+                video_decoder.get_frames_in_range(start, end).data.to(torch.float16) / 255.0
+            )
+            current_chunk_output = process_single_temporal_chunk(
+                pipe,
+                chunk_frames,
+                scale,
+                color_fix,
+                spatial_tiling,
+                spatial_tile_size,
+                spatial_tile_overlap,
+                unload_dit,
+                sparse_ratio,
+                kv_ratio,
+                local_range,
+                seed,
+                force_offload,
+            )
+            del chunk_frames
+            clean_vram()
+
+            # Determine what to write
+            if chunk_idx == 0:
+                # First chunk: write everything except the tail (overlap region)
+                frames_to_write = (
+                    current_chunk_output[:-temporal_tile_overlap]
+                    if temporal_tile_overlap > 0
+                    else current_chunk_output
+                )
+                prev_chunk_tail = (
+                    current_chunk_output[-temporal_tile_overlap:]
+                    if temporal_tile_overlap > 0
+                    else None
+                )
+            else:
+                # Subsequent chunks: blend overlap, then write
+                overlap_head = current_chunk_output[:temporal_tile_overlap]
+                blended_overlap = blend_overlap_region(
+                    prev_chunk_tail, overlap_head, temporal_tile_overlap
+                )
+
+                # Write blended overlap + rest of current chunk (except new tail)
+                rest_of_chunk = current_chunk_output[temporal_tile_overlap:]
+
+                if chunk_idx == len(chunks) - 1:
+                    # Last chunk: write everything including tail
+                    frames_to_write = torch.cat([blended_overlap, rest_of_chunk], dim=0)
+                    prev_chunk_tail = None
+                else:
+                    # Not last chunk: save tail for next iteration
+                    frames_to_write = (
+                        torch.cat([blended_overlap, rest_of_chunk[:-temporal_tile_overlap]], dim=0)
+                        if temporal_tile_overlap > 0
+                        else torch.cat([blended_overlap, rest_of_chunk], dim=0)
+                    )
+                    prev_chunk_tail = (
+                        rest_of_chunk[-temporal_tile_overlap:]
+                        if temporal_tile_overlap > 0
+                        and rest_of_chunk.shape[0] >= temporal_tile_overlap
+                        else rest_of_chunk
+                    )
+
+            encoder = VideoEncoder(
+                frames=(frames_to_write.permute(0, 3, 1, 2).clamp(0, 1) * 255).to(torch.uint8),
+                frame_rate=frame_rate,
+            )
+            encoder.to_file(
+                os.path.join(output_dir, f"chunk_{chunk_idx:03d}.mp4"),
+                codec="libx264",
+                crf=0,
+                pixel_format="yuv420p",
+            )
+
+            log(
+                f"[FlashVSR] Saved chunk {chunk_idx + 1} with {frames_to_write.shape[0]} frames",
+                message_type="info",
+            )
+
+            del current_chunk_output, frames_to_write
+            clean_vram()
+
+    else:
+        # Process all frames at once (original behavior)
+        log(
+            f"[FlashVSR] Loading and processing all {total_frames} frames at once...",
+            message_type="info",
+        )
+
+        frames = video_decoder.get_frames_in_range(0, total_frames).data.to(torch.float16) / 255.0
+
+        add = next_8n5(total_frames) - total_frames
+        if add > 0:
+            padding_frames = frames[-1:, :, :, :].repeat(add, 1, 1, 1)
+            _frames = torch.cat([frames, padding_frames], dim=0)
+        else:
+            _frames = frames
+
+        final_output = process_single_temporal_chunk(
+            pipe,
+            _frames,
+            scale,
+            color_fix,
+            spatial_tiling,
+            spatial_tile_size,
+            spatial_tile_overlap,
+            unload_dit,
+            sparse_ratio,
+            kv_ratio,
+            local_range,
+            seed,
+            force_offload,
+        )
+
+        encoder = VideoEncoder(
+            frames=(final_output.permute(0, 3, 1, 2).clamp(0, 1) * 255).to(torch.uint8),
+            frame_rate=frame_rate,
+        )
+        encoder.to_file(
+            os.path.join(output_dir, "chunk_000.mp4"),
+            codec="libx264",
+            crf=0,
+            pixel_format="yuv420p",
+        )
+        log("[FlashVSR] Saved final output video.", message_type="info")
+
+        del frames, _frames, final_output
+        clean_vram()
+
+        log("[FlashVSR] Done.", message_type="info")
 
 
 def main():
     model = "FlashVSR-v1.1"
     scale = 4
-    tiled_vae = True
-    tiled_dit = True
+    spatial_tiling = True
+    temporal_tiling = True
     unload_dit = True
     seed = 0
 
-    video_path = "../videolq_videos/000.mp4"
+    spatial_tile_size = 128 + 32 + 32
+    spatial_tile_overlap = 24
+
+    temporal_tile_size = 100
+    temporal_tile_overlap = 4
+
+    video_path = "inputs/example0.mp4"
 
     decoder = VideoDecoder(video_path, dimension_order="NHWC")
-    frames = decoder[:].float() / 255.0
+    total_frames = len(decoder)
+
+    log(f"[FlashVSR] Video loaded: {total_frames} frames", message_type="info")
 
     _device = (
         "cuda:0"
@@ -402,29 +648,31 @@ def main():
         raise RuntimeError("No devices found to run FlashVSR!")
 
     pipe = init_pipeline(model, _device, torch.float16)
-    output = flashvsr(
+
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    output_dir = f"{video_name}_output"
+    os.makedirs(output_dir, exist_ok=True)
+
+    flashvsr(
         pipe=pipe,
-        frames=frames,
+        video_decoder=decoder,
+        total_frames=total_frames,
+        output_dir=output_dir,
+        frame_rate=30,
         scale=scale,
         color_fix=True,
-        tiled_vae=tiled_vae,
-        tiled_dit=tiled_dit,
-        tile_size=128 + 32 + 32,
-        tile_overlap=24,
+        spatial_tiling=spatial_tiling,
+        spatial_tile_size=spatial_tile_size,
+        spatial_tile_overlap=spatial_tile_overlap,
+        temporal_tiling=temporal_tiling,
+        temporal_tile_size=temporal_tile_size,
+        temporal_tile_overlap=temporal_tile_overlap,
         unload_dit=unload_dit,
         sparse_ratio=2.0,
         kv_ratio=3.0,
         local_range=11,
         seed=seed,
         force_offload=True,
-    )
-
-    encoder = VideoEncoder(output.permute(0, 3, 1, 2).mul(255).byte(), frame_rate=25)
-    encoder.to_file(
-        f"{os.path.splitext(os.path.basename(video_path))[0]}_out.mp4",
-        codec="libx264",
-        crf=0,
-        pixel_format="yuv420p",
     )
 
 
