@@ -1,7 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-
 import math
 import os
 from enum import Enum
@@ -35,44 +31,30 @@ def log(message: str, message_type: str = "normal"):
     print(f"{message}")
 
 
-def tensor2video(frames: torch.Tensor):
+# ========== TENSOR CONVERSION FUNCTIONS ==========
+def convert_tensor_to_video(frames: torch.Tensor):
+    """Convert tensor from model output format to video format."""
     video_squeezed = frames.squeeze(0)
     video_permuted = rearrange(video_squeezed, "C F H W -> F H W C")
     video_final = (video_permuted.float() + 1.0) / 2.0
     return video_final
 
 
-def largest_8n1_leq(n):  # 8n+1
-    return 0 if n < 1 else ((n - 1) // 8) * 8 + 1
-
-
-def next_8n5(n):  # next 8n+5
-    return 21 if n < 21 else ((n - 5 + 7) // 8) * 8 + 5
-
-
-def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128):
-    if w0 <= 0 or h0 <= 0:
-        raise ValueError("invalid original size")
-
-    sW, sH = w0 * scale, h0 * scale
-    # Round UP to next multiple to avoid cropping
-    tW = ((sW + multiple - 1) // multiple) * multiple
-    tH = ((sH + multiple - 1) // multiple) * multiple
-    return sW, sH, tW, tH
-
-
-def tensor_upscale_then_pad(
-    frame_tensor: torch.Tensor, scale: int, tW: int, tH: int
+def upscale_and_pad_tensor(
+    frame_tensor: torch.Tensor, scale: int, target_width: int, target_height: int
 ) -> torch.Tensor:
+    """Upscale a frame tensor and pad to target dimensions."""
     h0, w0, c = frame_tensor.shape
     tensor_bchw = frame_tensor.permute(2, 0, 1).unsqueeze(0)  # HWC -> CHW -> BCHW
 
-    sW, sH = w0 * scale, h0 * scale
-    upscaled_tensor = F.interpolate(tensor_bchw, size=(sH, sW), mode="bicubic", align_corners=False)
+    scaled_width, scaled_height = w0 * scale, h0 * scale
+    upscaled_tensor = F.interpolate(
+        tensor_bchw, size=(scaled_height, scaled_width), mode="bicubic", align_corners=False
+    )
 
     # Pad instead of crop
-    pad_w = tW - sW
-    pad_h = tH - sH
+    pad_w = target_width - scaled_width
+    pad_h = target_height - scaled_height
 
     # Symmetric padding (split difference on both sides)
     pad_left = pad_w // 2
@@ -89,12 +71,15 @@ def tensor_upscale_then_pad(
 
 
 def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.float16):
+    """Prepare input tensor for model inference with proper dimensions and padding."""
     N0, h0, w0, _ = image_tensor.shape
 
     multiple = 128
-    sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
+    scaled_width, scaled_height, target_width, target_height = compute_scaled_and_target_dims(
+        w0, h0, scale=scale, multiple=multiple
+    )
     num_frames_with_padding = N0 + 4
-    F = largest_8n1_leq(num_frames_with_padding)
+    F = calculate_padded_frame_count(num_frames_with_padding)
 
     if F == 0:
         raise RuntimeError(f"Not enough frames after padding. Got {num_frames_with_padding}.")
@@ -104,7 +89,11 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
         frame_idx = min(i, N0 - 1)
         frame_slice = image_tensor[frame_idx].to(device)
         tensor_chw = (
-            tensor_upscale_then_pad(frame_slice, scale=scale, tW=tW, tH=tH).to("cpu").to(dtype)
+            upscale_and_pad_tensor(
+                frame_slice, scale=scale, target_width=target_width, target_height=target_height
+            )
+            .to("cpu")
+            .to(dtype)
             * 2.0
             - 1.0
         )
@@ -117,10 +106,35 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
     del vid_stacked
     clean_vram()
 
-    return vid_final, tH, tW, F
+    return vid_final, target_height, target_width, F
 
 
-def calculate_tile_coords(height, width, tile_size, overlap):
+# ========== DIMENSION CALCULATION FUNCTIONS ==========
+def calculate_padded_frame_count(n):
+    """Calculate largest frame count in format 8n+1 that is <= n."""
+    return 0 if n < 1 else ((n - 1) // 8) * 8 + 1
+
+
+def calculate_next_frame_requirement(n):
+    """Calculate next frame count in format 8n+5."""
+    return 21 if n < 21 else ((n - 5 + 7) // 8) * 8 + 5
+
+
+def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128):
+    """Compute scaled dimensions and target dimensions aligned to multiple."""
+    if w0 <= 0 or h0 <= 0:
+        raise ValueError("invalid original size")
+
+    scaled_width, scaled_height = w0 * scale, h0 * scale
+    # Round UP to next multiple to avoid cropping
+    target_width = ((scaled_width + multiple - 1) // multiple) * multiple
+    target_height = ((scaled_height + multiple - 1) // multiple) * multiple
+    return scaled_width, scaled_height, target_width, target_height
+
+
+# ========== TILING CALCULATION FUNCTIONS ==========
+def calculate_spatial_tile_coords(height, width, tile_size, overlap):
+    """Calculate spatial tile coordinates with overlap for tiled processing."""
     coords = []
 
     stride = tile_size - overlap
@@ -145,7 +159,24 @@ def calculate_tile_coords(height, width, tile_size, overlap):
     return coords
 
 
-def create_feather_mask(size, overlap):
+def calculate_temporal_tile_ranges(total_frames, chunk_size, overlap):
+    """Calculate temporal chunk ranges with overlap for tiled processing."""
+    chunks = []
+    stride = chunk_size - overlap
+
+    num_chunks = math.ceil((total_frames - overlap) / stride)
+
+    for i in range(num_chunks):
+        start = i * stride
+        end = min(start + chunk_size, total_frames)
+        chunks.append((start, end))
+
+    return chunks
+
+
+# ========== BLENDING AND MASKING FUNCTIONS ==========
+def create_spatial_blend_mask(size, overlap):
+    """Create feather mask for blending spatial tiles."""
     H, W = size
     mask = torch.ones(1, 1, H, W)
     ramp = torch.linspace(0, 1, overlap)
@@ -163,24 +194,8 @@ def create_feather_mask(size, overlap):
     return mask
 
 
-def calculate_temporal_chunks(total_frames, chunk_size, overlap):
-    """Calculate temporal chunk ranges with overlap."""
-    chunks = []
-    stride = chunk_size - overlap
-
-    num_chunks = math.ceil((total_frames - overlap) / stride)
-
-    for i in range(num_chunks):
-        start = i * stride
-        end = min(start + chunk_size, total_frames)
-        chunks.append((start, end))
-
-    return chunks
-
-
-def blend_overlap_region(prev_chunk_tail, current_chunk_head, overlap):
-    """
-    Blend only the overlapping region of two chunks.
+def blend_temporal_overlap(prev_chunk_tail, current_chunk_head, overlap):
+    """Blend overlapping region of two temporal chunks.
 
     Args:
         prev_chunk_tail: Last 'overlap' frames from previous chunk
@@ -209,6 +224,7 @@ def blend_overlap_region(prev_chunk_tail, current_chunk_head, overlap):
     return blended
 
 
+# ========== PIPELINE INITIALIZATION ==========
 def init_pipeline(model: str, device: torch.device, dtype: torch.dtype) -> FlashVSRTinyPipeline:
     """Initialize FlashVSR pipeline with given model and device.
 
@@ -279,6 +295,7 @@ def init_pipeline(model: str, device: torch.device, dtype: torch.dtype) -> Flash
     return pipe
 
 
+# ========== PROCESSING FUNCTIONS ==========
 def process_single_temporal_chunk(
     pipe,
     frames_chunk,
@@ -299,7 +316,7 @@ def process_single_temporal_chunk(
     dtype = pipe.torch_dtype
 
     # Add padding frames for model requirements
-    add = next_8n5(frames_chunk.shape[0]) - frames_chunk.shape[0]
+    add = calculate_next_frame_requirement(frames_chunk.shape[0]) - frames_chunk.shape[0]
     if add > 0:
         padding_frames = frames_chunk[-1:, :, :, :].repeat(add, 1, 1, 1)
         _frames = torch.cat([frames_chunk, padding_frames], dim=0)
@@ -313,7 +330,7 @@ def process_single_temporal_chunk(
             (N, H * scale, W * scale, C), dtype=torch.float16, device="cpu"
         )
         weight_sum_canvas = torch.zeros_like(final_output_canvas)
-        tile_coords = calculate_tile_coords(H, W, spatial_tile_size, spatial_tile_overlap)
+        tile_coords = calculate_spatial_tile_coords(H, W, spatial_tile_size, spatial_tile_overlap)
 
         for i, (x1, y1, x2, y2) in enumerate(tile_coords):
             log(
@@ -347,7 +364,7 @@ def process_single_temporal_chunk(
                 force_offload=force_offload,
             )
 
-            processed_tile_cpu = tensor2video(output_tile_gpu).to("cpu")
+            processed_tile_cpu = convert_tensor_to_video(output_tile_gpu).to("cpu")
 
             exact_tile_h = input_tile_h * scale
             exact_tile_w = input_tile_w * scale
@@ -363,7 +380,7 @@ def process_single_temporal_chunk(
                 :, crop_top:crop_bottom, crop_left:crop_right, :
             ]
 
-            mask_nchw = create_feather_mask(
+            mask_nchw = create_spatial_blend_mask(
                 (exact_tile_h, exact_tile_w), spatial_tile_overlap * scale
             ).to("cpu")
             mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
@@ -405,7 +422,7 @@ def process_single_temporal_chunk(
             force_offload=force_offload,
         )
 
-        final_output = tensor2video(video).to("cpu")
+        final_output = convert_tensor_to_video(video).to("cpu")
 
         del video, LQ
         clean_vram()
@@ -461,7 +478,9 @@ def flashvsr(
             message_type="info",
         )
 
-        chunks = calculate_temporal_chunks(total_frames, temporal_tile_size, temporal_tile_overlap)
+        chunks = calculate_temporal_tile_ranges(
+            total_frames, temporal_tile_size, temporal_tile_overlap
+        )
         log(f"[FlashVSR] Created {len(chunks)} temporal chunks", message_type="info")
 
         prev_chunk_tail = None  # Store only the overlapping tail from previous chunk
@@ -512,7 +531,7 @@ def flashvsr(
             else:
                 # Subsequent chunks: blend overlap, then write
                 overlap_head = current_chunk_output[:temporal_tile_overlap]
-                blended_overlap = blend_overlap_region(
+                blended_overlap = blend_temporal_overlap(
                     prev_chunk_tail, overlap_head, temporal_tile_overlap
                 )
 
@@ -582,7 +601,7 @@ def flashvsr(
 
         frames = video_decoder.get_frames_in_range(0, total_frames).data.to(torch.float16) / 255.0
 
-        add = next_8n5(total_frames) - total_frames
+        add = calculate_next_frame_requirement(total_frames) - total_frames
         if add > 0:
             padding_frames = frames[-1:, :, :, :].repeat(add, 1, 1, 1)
             _frames = torch.cat([frames, padding_frames], dim=0)
