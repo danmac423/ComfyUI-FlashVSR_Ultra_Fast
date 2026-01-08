@@ -1,5 +1,5 @@
 [project]
-name = "comfyui-flashvsr-ultra-fast"
+name = "flashvsr-ultra-fast"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
