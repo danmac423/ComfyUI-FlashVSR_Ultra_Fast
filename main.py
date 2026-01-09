@@ -1,6 +1,7 @@
 import math
 import os
 from enum import Enum
+from typing import Tuple
 
 import torch
 import torch.nn.functional as F
@@ -10,9 +11,15 @@ from torchcodec.encoders import VideoEncoder
 from torchvision.io import write_png
 from tqdm import tqdm
 
-from src import FlashVSRTinyPipeline, ModelManager
+from src import BasePipeline, FlashVSRTinyPipeline, ModelManager
 from src.models.TCDecoder import build_tcdecoder
 from src.models.utils import Causal_LQ4x_Proj, clean_vram, get_device_list
+
+
+class OutputMode(Enum):
+    VIDEO = "video"
+    FRAMES = "frames"
+
 
 device_choices = get_device_list()
 
@@ -36,42 +43,42 @@ def convert_tensor_to_video(frames: torch.Tensor):
     """Convert tensor from model output format to video format."""
     video_squeezed = frames.squeeze(0)
     video_permuted = rearrange(video_squeezed, "C F H W -> F H W C")
-    video_final = (video_permuted.float() + 1.0) / 2.0
+    video_final = (video_permuted.to(torch.float16) + 1.0) / 2.0
     return video_final
 
 
-def upscale_and_pad_tensor(
-    frame_tensor: torch.Tensor, scale: int, target_width: int, target_height: int
-) -> torch.Tensor:
-    """Upscale a frame tensor and pad to target dimensions."""
-    h0, w0, c = frame_tensor.shape
-    tensor_bchw = frame_tensor.permute(2, 0, 1).unsqueeze(0)  # HWC -> CHW -> BCHW
+def upscale_and_normalize_tensor(
+    frame_tensor: torch.Tensor,
+    scaled_height: int,
+    scaled_width: int,
+    target_height: int,
+    target_width: int,
+) -> Tuple[torch.Tensor, Tuple[int, int, int, int]]:
+    tensor_bchw = rearrange(frame_tensor, "H W C -> 1 C H W")  # HWC -> BCHW
 
-    scaled_width, scaled_height = w0 * scale, h0 * scale
     upscaled_tensor = F.interpolate(
         tensor_bchw, size=(scaled_height, scaled_width), mode="bicubic", align_corners=False
     )
 
-    # Pad instead of crop
-    pad_w = target_width - scaled_width
     pad_h = target_height - scaled_height
-
-    # Symmetric padding (split difference on both sides)
-    pad_left = pad_w // 2
-    pad_right = pad_w - pad_left
+    pad_w = target_width - scaled_width
     pad_top = pad_h // 2
     pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
 
-    # F.pad uses (left, right, top, bottom) for last 2 dimensions
     padded_tensor = F.pad(
-        upscaled_tensor, (pad_left, pad_right, pad_top, pad_bottom), mode="replicate"
+        upscaled_tensor, [pad_left, pad_right, pad_top, pad_bottom], mode="reflect"
     )
 
-    return padded_tensor.squeeze(0)
+    normalized_tensor = padded_tensor.clamp(0.0, 1.0).mul(255).round().div(255).mul(2).sub(1.0)
+
+    return normalized_tensor.squeeze(0), (pad_left, pad_right, pad_top, pad_bottom)
 
 
-def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.float16):
-    """Prepare input tensor for model inference with proper dimensions and padding."""
+def prepare_input_tensor(
+    image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.float16
+) -> Tuple[torch.Tensor, int, int, int, int, int, Tuple[int, int, int, int]]:
     N0, h0, w0, _ = image_tensor.shape
 
     multiple = 128
@@ -88,15 +95,15 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
     for i in range(F):
         frame_idx = min(i, N0 - 1)
         frame_slice = image_tensor[frame_idx].to(device)
-        tensor_chw = (
-            upscale_and_pad_tensor(
-                frame_slice, scale=scale, target_width=target_width, target_height=target_height
-            )
-            .to("cpu")
-            .to(dtype)
-            * 2.0
-            - 1.0
+        tensor_chw, padding = upscale_and_normalize_tensor(
+            frame_slice,
+            scaled_height=scaled_height,
+            scaled_width=scaled_width,
+            target_width=target_width,
+            target_height=target_height,
         )
+        tensor_chw.to("cpu").to(dtype)
+
         frames.append(tensor_chw)
         del frame_slice
 
@@ -106,7 +113,7 @@ def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dty
     del vid_stacked
     clean_vram()
 
-    return vid_final, target_height, target_width, F
+    return vid_final, scaled_height, scaled_width, target_height, target_width, F, padding
 
 
 # ========== DIMENSION CALCULATION FUNCTIONS ==========
@@ -133,26 +140,67 @@ def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: i
 
 
 # ========== TILING CALCULATION FUNCTIONS ==========
-def calculate_spatial_tile_coords(height, width, tile_size, overlap):
+def adjust_spatial_tile_size(
+    tile_size: Tuple[int, int], frame_width: int, frame_height: int, scale: int
+):
+    """
+    Adjust spatial tile size to ensure it doesn't exceed frame dimensions
+    and remains divisible by 128/scale.
+
+    Args:
+        tile_size: (tile_width, tile_height)
+        frame_width: Width of the frame
+        frame_height: Height of the frame
+        scale: Upscaling factor
+
+    Returns:
+        Adjusted (tile_width, tile_height)
+    """
+    tile_w, tile_h = tile_size
+    multiple = 128 // scale  # e.g., 32 for scale=4
+
+    # Adjust width if needed
+    if tile_w > frame_width:
+        # Find largest value <= frame_width that is divisible by multiple
+        tile_w = (frame_width // multiple) * multiple
+        if tile_w == 0:
+            tile_w = multiple
+
+    # Adjust height if needed
+    if tile_h > frame_height:
+        # Find largest value <= frame_height that is divisible by multiple
+        tile_h = (frame_height // multiple) * multiple
+        if tile_h == 0:
+            tile_h = multiple
+
+    return tile_w, tile_h
+
+
+def calculate_spatial_tile_coords(
+    height: int, width: int, tile_size: Tuple[int, int], overlap: int
+):
     """Calculate spatial tile coordinates with overlap for tiled processing."""
     coords = []
+    tile_w, tile_h = tile_size
 
-    stride = tile_size - overlap
-    num_rows = math.ceil((height - overlap) / stride)
-    num_cols = math.ceil((width - overlap) / stride)
+    stride_w = tile_w - overlap
+    stride_h = tile_h - overlap
+
+    num_rows = math.ceil((height - overlap) / stride_h)
+    num_cols = math.ceil((width - overlap) / stride_w)
 
     for r in range(num_rows):
         for c in range(num_cols):
-            y1 = r * stride
-            x1 = c * stride
+            y1 = r * stride_h
+            x1 = c * stride_w
 
-            y2 = min(y1 + tile_size, height)
-            x2 = min(x1 + tile_size, width)
+            y2 = min(y1 + tile_h, height)
+            x2 = min(x1 + tile_w, width)
 
-            if y2 - y1 < tile_size:
-                y1 = max(0, y2 - tile_size)
-            if x2 - x1 < tile_size:
-                x1 = max(0, x2 - tile_size)
+            if y2 - y1 < tile_h:
+                y1 = max(0, y2 - tile_h)
+            if x2 - x1 < tile_w:
+                x1 = max(0, x2 - tile_w)
 
             coords.append((x1, y1, x2, y2))
 
@@ -297,19 +345,19 @@ def init_pipeline(model: str, device: torch.device, dtype: torch.dtype) -> Flash
 
 # ========== PROCESSING FUNCTIONS ==========
 def process_single_temporal_chunk(
-    pipe,
-    frames_chunk,
-    scale,
-    color_fix,
-    spatial_tiling,
-    spatial_tile_size,
-    spatial_tile_overlap,
-    unload_dit,
-    sparse_ratio,
-    kv_ratio,
-    local_range,
-    seed,
-    force_offload,
+    pipe: BasePipeline,
+    frames_chunk: torch.Tensor,
+    scale: int,
+    color_fix: bool,
+    spatial_tiling: bool,
+    spatial_tile_size: Tuple[int, int],
+    spatial_tile_overlap: int,
+    unload_dit: bool,
+    sparse_ratio: float,
+    kv_ratio: float,
+    local_range: int,
+    seed: int,
+    force_offload: bool,
 ):
     """Process a single temporal chunk of frames."""
     _device = pipe.device
@@ -338,10 +386,10 @@ def process_single_temporal_chunk(
                 message_type="info",
             )
             input_tile = _frames[:, y1:y2, x1:x2, :]
-            input_tile_h = y2 - y1
-            input_tile_w = x2 - x1
 
-            LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
+            LQ_tile, sh, sw, th, tw, F, padding = prepare_input_tensor(
+                input_tile, _device, scale=scale, dtype=dtype
+            )
             LQ_tile = LQ_tile.to(_device)
 
             output_tile_gpu = pipe(
@@ -366,27 +414,18 @@ def process_single_temporal_chunk(
 
             processed_tile_cpu = convert_tensor_to_video(output_tile_gpu).to("cpu")
 
-            exact_tile_h = input_tile_h * scale
-            exact_tile_w = input_tile_w * scale
+            if th > sh:
+                pad_top, pad_bottom = padding[2], padding[3]
+                processed_tile_cpu = processed_tile_cpu[:, pad_top : th - pad_bottom, :, :]
+            if tw > sw:
+                pad_left, pad_right = padding[0], padding[1]
+                processed_tile_cpu = processed_tile_cpu[:, :, pad_left : tw - pad_right, :]
 
-            pad_h = th - exact_tile_h
-            pad_w = tw - exact_tile_w
-
-            crop_top = pad_h // 2
-            crop_bottom = crop_top + exact_tile_h
-            crop_left = pad_w // 2
-            crop_right = crop_left + exact_tile_w
-            processed_tile_cpu = processed_tile_cpu[
-                :, crop_top:crop_bottom, crop_left:crop_right, :
-            ]
-
-            mask_nchw = create_spatial_blend_mask(
-                (exact_tile_h, exact_tile_w), spatial_tile_overlap * scale
-            ).to("cpu")
+            mask_nchw = create_spatial_blend_mask((sh, sw), spatial_tile_overlap * scale).to("cpu")
             mask_nhwc = mask_nchw.permute(0, 2, 3, 1)
 
             out_x1, out_y1 = x1 * scale, y1 * scale
-            out_x2, out_y2 = out_x1 + exact_tile_w, out_y1 + exact_tile_h
+            out_x2, out_y2 = out_x1 + sw, out_y1 + sh
 
             final_output_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += (
                 processed_tile_cpu * mask_nhwc
@@ -399,7 +438,9 @@ def process_single_temporal_chunk(
         weight_sum_canvas[weight_sum_canvas == 0] = 1.0
         final_output = final_output_canvas / weight_sum_canvas
     else:
-        LQ, th, tw, F = prepare_input_tensor(_frames, _device, scale=scale, dtype=dtype)
+        LQ, sh, sw, th, tw, F, padding = prepare_input_tensor(
+            _frames, _device, scale=scale, dtype=dtype
+        )
         LQ = LQ.to(_device)
 
         video = pipe(
@@ -424,6 +465,13 @@ def process_single_temporal_chunk(
 
         final_output = convert_tensor_to_video(video).to("cpu")
 
+        if th > sh:
+            pad_top, pad_bottom = padding[2], padding[3]
+            final_output = final_output[:, pad_top : th - pad_bottom, :, :]
+        if tw > sw:
+            pad_left, pad_right = padding[0], padding[1]
+            final_output = final_output[:, :, pad_left : tw - pad_right, :]
+
         del video, LQ
         clean_vram()
 
@@ -431,32 +479,27 @@ def process_single_temporal_chunk(
     return final_output[: frames_chunk.shape[0], :, :, :]
 
 
-class OutputMode(Enum):
-    VIDEO = 1
-    FRAMES = 2
-
-
 def flashvsr(
-    pipe,
+    pipe: BasePipeline,
     video_decoder: VideoDecoder,
-    total_frames,
-    output_dir,
-    frame_rate,
-    scale,
+    total_frames: int,
+    output_dir: str,
+    frame_rate: float,
+    scale: int,
     output_mode: OutputMode,
-    color_fix,
-    spatial_tiling,
-    spatial_tile_size,
-    spatial_tile_overlap,
-    temporal_tiling,
-    temporal_tile_size,
-    temporal_tile_overlap,
-    unload_dit,
-    sparse_ratio,
-    kv_ratio,
-    local_range,
-    seed,
-    force_offload,
+    color_fix: bool,
+    spatial_tiling: bool,
+    spatial_tile_size: Tuple[int, int],
+    spatial_tile_overlap: int,
+    temporal_tiling: bool,
+    temporal_tile_size: int,
+    temporal_tile_overlap: int,
+    unload_dit: bool,
+    sparse_ratio: float,
+    kv_ratio: float,
+    local_range: int,
+    seed: int,
+    force_offload: bool,
 ):
     """
     Process video using FlashVSR with temporal tiling support.
@@ -601,16 +644,9 @@ def flashvsr(
 
         frames = video_decoder.get_frames_in_range(0, total_frames).data.to(torch.float16) / 255.0
 
-        add = calculate_next_frame_requirement(total_frames) - total_frames
-        if add > 0:
-            padding_frames = frames[-1:, :, :, :].repeat(add, 1, 1, 1)
-            _frames = torch.cat([frames, padding_frames], dim=0)
-        else:
-            _frames = frames
-
         final_output = process_single_temporal_chunk(
             pipe,
-            _frames,
+            frames,
             scale,
             color_fix,
             spatial_tiling,
@@ -644,7 +680,7 @@ def flashvsr(
 
         log("[FlashVSR] Saved final output video.", message_type="info")
 
-        del frames, _frames, final_output
+        del frames, final_output
         clean_vram()
 
     log("[FlashVSR] Done.", message_type="info")
@@ -658,13 +694,13 @@ def main():
     unload_dit = True
     seed = 0
 
-    spatial_tile_size = 128 + 32 + 32
+    spatial_tile_size = (180, 180)
     spatial_tile_overlap = 24
 
     temporal_tile_size = 100
     temporal_tile_overlap = 4
 
-    # video_path = "inputs/example0.mp4"
+    # video_path = "inputs/example3.mp4"
     video_path = "../train_videos/000.mp4"
 
     decoder = VideoDecoder(video_path, dimension_order="NHWC")
@@ -693,9 +729,9 @@ def main():
         video_decoder=decoder,
         total_frames=total_frames,
         output_dir=output_dir,
-        frame_rate=30,
+        frame_rate=30.0,
         scale=scale,
-        output_mode=OutputMode.FRAMES,
+        output_mode=OutputMode.VIDEO,
         color_fix=True,
         spatial_tiling=spatial_tiling,
         spatial_tile_size=spatial_tile_size,
