@@ -9,24 +9,22 @@ from torchcodec.encoders import VideoEncoder
 from torchvision.io import write_png
 from tqdm import tqdm
 
-from ..config import (
+from src.config.processing import (
     IOConfig,
     OutputMode,
     ProcessingConfig,
     SpatialTilingConfig,
     TemporalTilingConfig,
 )
-from ..models.utils import clean_vram
-from ..pipelines import BasePipeline
-from ..utils import (
+from src.models.utils import clean_vram
+from src.pipelines.base import BasePipeline
+from src.utils.dimension import calculate_next_frame_requirement
+from src.utils.tensor import convert_tensor_to_video, prepare_input_tensor, remove_padding
+from src.utils.tiling import (
     blend_temporal_overlap,
-    calculate_next_frame_requirement,
     calculate_spatial_tile_coords,
     calculate_temporal_tile_ranges,
-    convert_tensor_to_video,
     create_spatial_blend_mask,
-    prepare_input_tensor,
-    remove_padding,
 )
 
 

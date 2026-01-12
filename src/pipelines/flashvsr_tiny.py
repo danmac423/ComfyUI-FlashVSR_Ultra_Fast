@@ -12,12 +12,12 @@ from PIL import Image
 from tqdm import tqdm
 # import pyfiglet
 
-from ..models import ModelManager
-from ..models.utils import clean_vram
-from ..models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d
-from ..models.wan_video_vae import WanVideoVAE, RMS_norm, CausalConv3d, Upsample
-from ..schedulers.flow_match import FlowMatchScheduler
-from .base import BasePipeline
+from src.models.model_manager import ModelManager
+from src.models.utils import clean_vram
+from src.models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d
+from src.models.wan_video_vae import WanVideoVAE, RMS_norm, CausalConv3d, Upsample
+from src.schedulers.flow_match import FlowMatchScheduler
+from src.pipelines.base import BasePipeline
 
 
 # -----------------------------
@@ -177,7 +177,11 @@ class FlashVSRTinyPipeline(BasePipeline):
     def enable_vram_management(self, num_persistent_param_in_dit=None):
         # 仅管理 dit / vae
         dtype = next(iter(self.dit.parameters())).dtype
-        from ..vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
+        from src.vram_management.layers import (
+            enable_vram_management,
+            AutoWrappedModule,
+            AutoWrappedLinear,
+        )
         enable_vram_management(
             self.dit,
             module_map={

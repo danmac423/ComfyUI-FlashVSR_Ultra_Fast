@@ -6,11 +6,11 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from .dimension import (
+from src.utils.dimension import (
     calculate_padded_frame_count,
     compute_scaled_and_target_dims,
 )
-from ..models.utils import clean_vram
+from src.models.utils import clean_vram
 
 
 def convert_tensor_to_video(frames: torch.Tensor) -> torch.Tensor:

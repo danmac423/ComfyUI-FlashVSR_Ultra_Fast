@@ -2,7 +2,7 @@ import os
 
 import torch
 
-from src.config import (
+from src.config.processing import (
     IOConfig,
     OutputMode,
     ProcessingConfig,
@@ -10,7 +10,8 @@ from src.config import (
     TemporalTilingConfig,
 )
 from src.models.utils import get_device_list
-from src.processing import flashvsr, init_pipeline
+from src.processing.pipeline import init_pipeline
+from src.processing.video import flashvsr
 
 
 def main():

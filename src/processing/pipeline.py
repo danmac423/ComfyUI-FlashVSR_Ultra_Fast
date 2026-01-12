@@ -4,10 +4,10 @@ import os
 
 import torch
 
-from ..models.TCDecoder import build_tcdecoder
-from ..models.utils import Causal_LQ4x_Proj
-from ..pipelines import FlashVSRTinyPipeline
-from ..models import ModelManager
+from src.models.TCDecoder import build_tcdecoder
+from src.models.utils import Causal_LQ4x_Proj
+from src.pipelines.flashvsr_tiny import FlashVSRTinyPipeline
+from src.models.model_manager import ModelManager
 
 
 def init_pipeline(model: str, device: torch.device, dtype: torch.dtype) -> FlashVSRTinyPipeline:
@@ -17,7 +17,7 @@ def init_pipeline(model: str, device: torch.device, dtype: torch.dtype) -> Flash
         model (str): Model name.
         device (torch.device): Device to load the model on.
         dtype (torch.dtype): Data type for model weights.
- 
+
     Returns: FlashVSRTinyPipeline: Initialized pipeline instance.
 
     Raises:

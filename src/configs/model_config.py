@@ -1,7 +1,7 @@
 from typing_extensions import Literal, TypeAlias
 
-from ..models.wan_video_dit import WanModel
-from ..models.wan_video_vae import WanVideoVAE
+from src.models.wan_video_dit import WanModel
+from src.models.wan_video_vae import WanVideoVAE
 
 
 model_loader_configs = [

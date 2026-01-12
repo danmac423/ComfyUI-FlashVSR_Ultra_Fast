@@ -7,7 +7,7 @@ import os
 import time
 from typing import Tuple, Optional, List
 from einops import rearrange
-from .utils import hash_state_dict_keys
+from src.models.utils import hash_state_dict_keys
 
 try:
     from sageattention import sageattn
