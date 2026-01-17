@@ -8,6 +8,7 @@ import time
 from typing import Tuple, Optional, List
 from einops import rearrange
 from src.models.utils import hash_state_dict_keys
+from enum import Enum
 
 try:
     from sageattention import sageattn
@@ -23,6 +24,23 @@ try:
     SPARSE_SAGE_ATTN_AVAILABLE = True
 except ModuleNotFoundError:
     SPARSE_SAGE_ATTN_AVAILABLE = False
+
+try:
+    from block_sparse_attn import block_sparse_attn_func
+
+    BLOCK_SPARSE_ATTN_AVAILABLE = True
+except ModuleNotFoundError:
+    BLOCK_SPARSE_ATTN_AVAILABLE = False
+
+
+class AttentionMode(Enum):
+    SAGE = "sage"
+    FLASH = "flash"
+
+
+class MaskAttentionMode(Enum):
+    SPARSE_SAGE = "sparse_sage"
+    BLOCK_SPARSE = "block_sparse"
 
 
 # ----------------------------
@@ -220,11 +238,15 @@ def flash_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     num_heads: int,
-    compatibility_mode=False,
+    attn_mode: AttentionMode = AttentionMode.FLASH,
+    mask_attn_mode: Optional[MaskAttentionMode] = None,
     attention_mask=None,
-    return_KV=False,
 ):
-    if attention_mask is not None:
+    if (
+        attention_mask is not None
+        and mask_attn_mode == MaskAttentionMode.SPARSE_SAGE
+        and SPARSE_SAGE_ATTN_AVAILABLE
+    ):
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
@@ -234,20 +256,65 @@ def flash_attention(
             q, k, v, mask_id=base_blockmask.to(torch.int8), tensor_layout="HND"
         )
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    else:
-        if SAGE_ATTN_AVAILABLE:
-            q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-            k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-            v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-            x = sageattn(q, k, v)
-            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-        else:
-            # Flash Attention 2
-            q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-            k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-            v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-            x = F.scaled_dot_product_attention(q, k, v)
-            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        return x
+
+    if (
+        attention_mask is not None
+        and mask_attn_mode == MaskAttentionMode.BLOCK_SPARSE
+        and BLOCK_SPARSE_ATTN_AVAILABLE
+    ):
+        seqlen = q.shape[1]
+        seqlen_kv = k.shape[1]
+
+        q = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)
+        k = rearrange(k, "b s (n d) -> (b s) n d", n=num_heads)
+        v = rearrange(v, "b s (n d) -> (b s) n d", n=num_heads)
+
+        cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
+        cu_seqlens_k = torch.tensor([0, seqlen_kv], device=k.device, dtype=torch.int32)
+        head_mask_type = torch.tensor([1] * num_heads, device=q.device, dtype=torch.int32)
+
+        streaming_info = None
+        base_blockmask = attention_mask
+        max_seqlen_q_ = seqlen
+        max_seqlen_k_ = seqlen_kv
+        p_dropout = 0.0
+
+        x = block_sparse_attn_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            head_mask_type,
+            streaming_info,
+            base_blockmask,
+            max_seqlen_q_,
+            max_seqlen_k_,
+            p_dropout,
+            deterministic=False,
+            softmax_scale=None,
+            is_causal=False,
+            exact_streaming=False,
+            return_attn_probs=False,
+        ).unsqueeze(0)
+        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+        return x
+
+    if attention_mask is None and attn_mode == AttentionMode.SAGE and SAGE_ATTN_AVAILABLE:
+        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+        x = sageattn(q, k, v)
+        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        return x
+
+    # Flash Attention 2
+    q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+    k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+    v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+    x = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
+    x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
     return x
 
 
@@ -308,17 +375,39 @@ class RMSNorm(nn.Module):
 
 
 class AttentionModule(nn.Module):
-    def __init__(self, num_heads):
+    def __init__(
+        self,
+        num_heads,
+        attn_mode: AttentionMode = AttentionMode.FLASH,
+        mask_attn_mode: Optional[MaskAttentionMode] = None,
+    ):
         super().__init__()
         self.num_heads = num_heads
+        self.attn_mode = attn_mode
+        self.mask_attn_mode = mask_attn_mode
 
     def forward(self, q, k, v, attention_mask=None):
-        x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, attention_mask=attention_mask)
+        x = flash_attention(
+            q=q,
+            k=k,
+            v=v,
+            num_heads=self.num_heads,
+            attention_mask=attention_mask,
+            attn_mode=self.attn_mode,
+            mask_attn_mode=self.mask_attn_mode,
+        )
         return x
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+        attn_mode: AttentionMode = AttentionMode.FLASH,
+        mask_attn_mode: Optional[MaskAttentionMode] = None,
+    ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -331,7 +420,12 @@ class SelfAttention(nn.Module):
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
 
-        self.attn = AttentionModule(self.num_heads)
+        self.attn_mode = attn_mode
+        self.mask_attn_mode = mask_attn_mode
+
+        self.attn = AttentionModule(
+            self.num_heads, attn_mode=attn_mode, mask_attn_mode=mask_attn_mode
+        )
         self.local_attn_mask = None
 
     def forward(
@@ -403,26 +497,26 @@ class SelfAttention(nn.Module):
             block_s=block_s,
         )
 
-        grid_h = h // 8
-        grid_w = w // 8
+        if (
+            self.local_attn_mask is None
+            or self.local_attn_mask_h != h // 8
+            or self.local_attn_mask_w != w // 8
+            or self.local_range != local_range
+        ):
+            self.local_attn_mask = build_local_block_mask_shifted_vec_normal_slide(
+                h // 8, w // 8, local_range, local_range, include_self=True, device=k_w.device
+            )
+            self.local_attn_mask_h = h // 8
+            self.local_attn_mask_w = w // 8
+            self.local_range = local_range
 
-        if local_range >= grid_h and local_range >= grid_w:
-            attention_mask = None
-        else:
-            if (
-                self.local_attn_mask is None
-                or self.local_attn_mask_h != h // 8
-                or self.local_attn_mask_w != w // 8
-                or self.local_range != local_range
-            ):
-                self.local_attn_mask = build_local_block_mask_shifted_vec_normal_slide(
-                    h // 8, w // 8, local_range, local_range, include_self=True, device=k_w.device
-                )
-                self.local_attn_mask_h = h // 8
-                self.local_attn_mask_w = w // 8
-                self.local_range = local_range
-
+        attention_mask = None
+        if self.mask_attn_mode == MaskAttentionMode.SPARSE_SAGE:
             attention_mask = generate_draft_block_mask_sage(
+            B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask
+        )
+        elif self.mask_attn_mode == MaskAttentionMode.BLOCK_SPARSE:
+            attention_mask = generate_draft_block_mask(
                 B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask
             )
 
@@ -453,7 +547,14 @@ class CrossAttention(nn.Module):
     仅考虑文本 context；提供持久 KV 缓存。
     """
 
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+        attn_mode: AttentionMode = AttentionMode.FLASH,
+        mask_attn_mode: Optional[MaskAttentionMode] = None,
+    ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -467,7 +568,9 @@ class CrossAttention(nn.Module):
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
 
-        self.attn = AttentionModule(self.num_heads)
+        self.attn = AttentionModule(
+            self.num_heads, attn_mode=attn_mode, mask_attn_mode=mask_attn_mode
+        )
 
         # 持久缓存
         self.cache_k = None
@@ -507,14 +610,26 @@ class GateModule(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        ffn_dim: int,
+        eps: float = 1e-6,
+        attn_mode: AttentionMode = AttentionMode.FLASH,
+        mask_attn_mode: Optional[MaskAttentionMode] = None,
+    ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
 
-        self.self_attn = SelfAttention(dim, num_heads, eps)
-        self.cross_attn = CrossAttention(dim, num_heads, eps)
+        self.self_attn = SelfAttention(
+            dim, num_heads, eps, attn_mode=attn_mode, mask_attn_mode=mask_attn_mode
+        )
+        self.cross_attn = CrossAttention(
+            dim, num_heads, eps, attn_mode=attn_mode, mask_attn_mode=mask_attn_mode
+        )
 
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -631,6 +746,8 @@ class WanModel(torch.nn.Module):
         num_layers: int,
         # init_context: torch.Tensor,     # <<<< 必填：在 __init__ 里用它生成 cross-attn KV 缓存
         has_image_input: bool = False,
+        attn_mode: AttentionMode = AttentionMode.FLASH,
+        mask_attn_mode: Optional[MaskAttentionMode] = None,
     ):
         super().__init__()
         self.dim = dim
@@ -651,7 +768,12 @@ class WanModel(torch.nn.Module):
 
         # blocks
         self.blocks = nn.ModuleList(
-            [DiTBlock(dim, num_heads, ffn_dim, eps) for _ in range(num_layers)]
+            [
+                DiTBlock(
+                    dim, num_heads, ffn_dim, eps, attn_mode=attn_mode, mask_attn_mode=mask_attn_mode
+                )
+                for _ in range(num_layers)
+            ]
         )
         self.head = Head(dim, out_dim, patch_size, eps)
 
@@ -848,7 +970,7 @@ class WanModelStateDictConverter:
     def __init__(self):
         pass
 
-    def from_diffusers(self, state_dict):
+    def from_diffusers(self, state_dict, **kwargs):
         rename_dict = {
             "blocks.0.attn1.norm_k.weight": "blocks.0.self_attn.norm_k.weight",
             "blocks.0.attn1.norm_q.weight": "blocks.0.self_attn.norm_q.weight",
@@ -922,12 +1044,14 @@ class WanModelStateDictConverter:
                 "qk_norm": True,
                 "cross_attn_norm": True,
                 "eps": 1e-6,
+                "attn_mode": kwargs.get("attn_mode", "flash"),
+                "mask_attn_mode": kwargs.get("mask_attn_mode", None),
             }
         else:
             config = {}
         return state_dict_, config
 
-    def from_civitai(self, state_dict):
+    def from_civitai(self, state_dict, **kwargs):
         state_dict = {
             name: param for name, param in state_dict.items() if not name.startswith("vace")
         }
@@ -945,6 +1069,8 @@ class WanModelStateDictConverter:
                 "num_heads": 12,
                 "num_layers": 30,
                 "eps": 1e-6,
+                "attn_mode": kwargs.get("attn_mode", "flash"),
+                "mask_attn_mode": kwargs.get("mask_attn_mode", None),
             }
         elif hash_state_dict_keys(state_dict) == "aafcfd9672c3a2456dc46e1cb6e52c70":
             config = {
@@ -959,6 +1085,8 @@ class WanModelStateDictConverter:
                 "num_heads": 40,
                 "num_layers": 40,
                 "eps": 1e-6,
+                "attn_mode": kwargs.get("attn_mode", "flash"),
+                "mask_attn_mode": kwargs.get("mask_attn_mode", None),
             }
         elif hash_state_dict_keys(state_dict) == "6bfcfb3b342cb286ce886889d519a77e":
             config = {
@@ -973,6 +1101,8 @@ class WanModelStateDictConverter:
                 "num_heads": 40,
                 "num_layers": 40,
                 "eps": 1e-6,
+                "attn_mode": kwargs.get("attn_mode", "flash"),
+                "mask_attn_mode": kwargs.get("mask_attn_mode", None),
             }
         elif hash_state_dict_keys(state_dict) == "6d6ccde6845b95ad9114ab993d917893":
             config = {
@@ -987,6 +1117,8 @@ class WanModelStateDictConverter:
                 "num_heads": 12,
                 "num_layers": 30,
                 "eps": 1e-6,
+                "attn_mode": kwargs.get("attn_mode", "flash"),
+                "mask_attn_mode": kwargs.get("mask_attn_mode", None),
             }
         elif hash_state_dict_keys(state_dict) == "349723183fc063b2bfc10bb2835cf677":
             config = {
@@ -1001,6 +1133,8 @@ class WanModelStateDictConverter:
                 "num_heads": 12,
                 "num_layers": 30,
                 "eps": 1e-6,
+                "attn_mode": kwargs.get("attn_mode", "flash"),
+                "mask_attn_mode": kwargs.get("mask_attn_mode", None),
             }
         elif hash_state_dict_keys(state_dict) == "efa44cddf936c70abd0ea28b6cbe946c":
             config = {
@@ -1015,6 +1149,8 @@ class WanModelStateDictConverter:
                 "num_heads": 40,
                 "num_layers": 40,
                 "eps": 1e-6,
+                "attn_mode": kwargs.get("attn_mode", "flash"),
+                "mask_attn_mode": kwargs.get("mask_attn_mode", None),
             }
         elif hash_state_dict_keys(state_dict) == "3ef3b1f8e1dab83d5b71fd7b617f859f":
             config = {
@@ -1030,6 +1166,8 @@ class WanModelStateDictConverter:
                 "num_layers": 40,
                 "eps": 1e-6,
                 "has_image_pos_emb": False,
+                "attn_mode": kwargs.get("attn_mode", "flash"),
+                "mask_attn_mode": kwargs.get("mask_attn_mode", None),
             }
         else:
             config = {}

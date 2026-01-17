@@ -8,16 +8,25 @@ from src.models.TCDecoder import build_tcdecoder
 from src.models.utils import Causal_LQ4x_Proj
 from src.pipelines.flashvsr_tiny import FlashVSRTinyPipeline
 from src.models.model_manager import ModelManager
+from src.models.wan_video_dit import AttentionMode, MaskAttentionMode
 
 
-def init_pipeline(model: str, device: torch.device, dtype: torch.dtype) -> FlashVSRTinyPipeline:
+def init_pipeline(
+    model: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    attn_mode: AttentionMode = AttentionMode.FLASH,
+    mask_attn_mode: MaskAttentionMode = None,
+) -> FlashVSRTinyPipeline:
     """Initialize FlashVSR pipeline with given model and device.
 
     Args:
         model (str): Model name.
         device (torch.device): Device to load the model on.
         dtype (torch.dtype): Data type for model weights.
-
+        attn_mode (AttentionMode): Attention mode for the DIT model.
+        mask_attn_mode (MaskAttentionMode): Mask attention mode for the DIT model.
+        
     Returns: FlashVSRTinyPipeline: Initialized pipeline instance.
 
     Raises:
@@ -48,7 +57,7 @@ def init_pipeline(model: str, device: torch.device, dtype: torch.dtype) -> Flash
     if not os.path.exists(prompt_path):
         raise RuntimeError(f'"posi_prompt.pth" does not exist!\nPlease save it to "{model_path}"')
 
-    mm = ModelManager(torch_dtype=dtype, device="cpu")
+    mm = ModelManager(torch_dtype=dtype, device="cpu", attn_mode=attn_mode, mask_attn_mode=mask_attn_mode)
 
     mm.load_models([ckpt_path])
 

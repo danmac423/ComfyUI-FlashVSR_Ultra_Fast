@@ -10,6 +10,7 @@ from src.config.processing import (
     TemporalTilingConfig,
 )
 from src.models.utils import get_device_list
+from src.models.wan_video_dit import AttentionMode, MaskAttentionMode
 from src.processing.pipeline import init_pipeline
 from src.processing.video import flashvsr
 
@@ -27,7 +28,7 @@ def main():
     if _device == "auto" or _device not in get_device_list():
         raise RuntimeError("No devices found to run FlashVSR!")
 
-    input_path = "inputs/example3.mp4"
+    input_path = "inputs/example2.mp4"
 
     video_name = os.path.splitext(os.path.basename(input_path))[0]
     output_dir = f"{video_name}_output"
@@ -42,6 +43,8 @@ def main():
         color_fix=True,
         unload_dit=True,
         force_offload=True,
+        attn_mode=AttentionMode.FLASH,
+        mask_attn_mode=MaskAttentionMode.BLOCK_SPARSE,
     )
     spatial_tiling_config = SpatialTilingConfig(
         enabled=True,
@@ -59,7 +62,13 @@ def main():
         output_dir=output_dir,
     )
 
-    pipe = init_pipeline(model, _device, torch.float16)
+    pipe = init_pipeline(
+        model,
+        _device,
+        torch.float16,
+        attn_mode=proc_config.attn_mode,
+        mask_attn_mode=proc_config.mask_attn_mode,
+    )
 
     flashvsr(
         pipe=pipe,

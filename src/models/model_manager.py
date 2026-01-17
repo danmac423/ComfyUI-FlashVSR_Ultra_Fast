@@ -3,16 +3,17 @@ from typing import List
 
 from src.configs.model_config import model_loader_configs, huggingface_model_loader_configs, patch_model_loader_configs
 from src.models.utils import load_state_dict, init_weights_on_device, hash_state_dict_keys, split_state_dict_with_prefix
+from src.models.wan_video_dit import AttentionMode, MaskAttentionMode
 
-def load_model_from_single_file(state_dict, model_names, model_classes, model_resource, torch_dtype, device):
+def load_model_from_single_file(state_dict, model_names, model_classes, model_resource, torch_dtype, device, **kwargs):
     loaded_model_names, loaded_models = [], []
     for model_name, model_class in zip(model_names, model_classes):
         #print(f"    model_name: {model_name} model_class: {model_class.__name__}")
         state_dict_converter = model_class.state_dict_converter()
         if model_resource == "civitai":
-            state_dict_results = state_dict_converter.from_civitai(state_dict)
+            state_dict_results = state_dict_converter.from_civitai(state_dict, **kwargs)
         elif model_resource == "diffusers":
-            state_dict_results = state_dict_converter.from_diffusers(state_dict)
+            state_dict_results = state_dict_converter.from_diffusers(state_dict, **kwargs)
         if isinstance(state_dict_results, tuple):
             model_state_dict, extra_kwargs = state_dict_results
             #print(f"        This model is initialized with extra kwargs: {extra_kwargs}")
@@ -132,7 +133,7 @@ class ModelDetectorFromSingleFile:
         keys_hash_with_shape = hash_state_dict_keys(state_dict, with_shape=True)
         if keys_hash_with_shape in self.keys_hash_with_shape_dict:
             model_names, model_classes, model_resource = self.keys_hash_with_shape_dict[keys_hash_with_shape]
-            loaded_model_names, loaded_models = load_model_from_single_file(state_dict, model_names, model_classes, model_resource, torch_dtype, device)
+            loaded_model_names, loaded_models = load_model_from_single_file(state_dict, model_names, model_classes, model_resource, torch_dtype, device, **kwargs)
             return loaded_model_names, loaded_models
 
         # Load models without strict matching
@@ -140,7 +141,7 @@ class ModelDetectorFromSingleFile:
         keys_hash = hash_state_dict_keys(state_dict, with_shape=False)
         if keys_hash in self.keys_hash_dict:
             model_names, model_classes, model_resource = self.keys_hash_dict[keys_hash]
-            loaded_model_names, loaded_models = load_model_from_single_file(state_dict, model_names, model_classes, model_resource, torch_dtype, device)
+            loaded_model_names, loaded_models = load_model_from_single_file(state_dict, model_names, model_classes, model_resource, torch_dtype, device, **kwargs)
             return loaded_model_names, loaded_models
 
         return loaded_model_names, loaded_models
@@ -270,9 +271,13 @@ class ModelManager:
         torch_dtype=torch.float16,
         device="cuda",
         file_path_list: List[str] = [],
+        attn_mode: AttentionMode = AttentionMode.FLASH,
+        mask_attn_mode: MaskAttentionMode = None,
     ):
         self.torch_dtype = torch_dtype
         self.device = device
+        self.attn_mode = attn_mode
+        self.mask_attn_mode = mask_attn_mode
         self.model = []
         self.model_path = []
         self.model_name = []
@@ -357,7 +362,8 @@ class ModelManager:
                 model_names, models = model_detector.load(
                     file_path, state_dict,
                     device=device, torch_dtype=torch_dtype,
-                    allowed_model_names=model_names, model_manager=self
+                    allowed_model_names=model_names, model_manager=self,
+                    attn_mode=self.attn_mode, mask_attn_mode=self.mask_attn_mode
                 )
                 for model_name, model in zip(model_names, models):
                     self.model.append(model)
